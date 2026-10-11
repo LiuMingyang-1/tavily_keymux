@@ -8,3 +8,4 @@ dist/
 .env.*
 coverage/
 *.log
+docs/client-config.md
