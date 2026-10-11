@@ -13,7 +13,9 @@ import {
 } from "./policy.js";
 
 const STATE_KEY = "pool-v1";
-const MAX_ATTEMPTS = 2;
+// Distinct keys tried per request. Kept small so failures on free-plan keys
+// can't fan a single client request out across the whole pool.
+const MAX_KEY_ATTEMPTS = 3;
 const UPSTREAM_TIMEOUT_MS = 20_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
@@ -114,7 +116,7 @@ export class TavilyKeyPool extends DurableObject<Env> {
     let lastFailure: FailureAction | undefined;
     for (
       let attempt = 0;
-      attempt < Math.min(MAX_ATTEMPTS, Object.keys(keys).length);
+      attempt < Math.min(MAX_KEY_ATTEMPTS, Object.keys(keys).length);
       attempt++
     ) {
       const id = await this.update(fingerprints, (state) =>

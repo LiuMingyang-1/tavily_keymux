@@ -76,9 +76,9 @@ export function retryDelay(header: string | null, now: number): number {
   const delay = Number.isFinite(seconds)
     ? seconds * 1000
     : Date.parse(header) - now;
-  return Number.isFinite(delay)
-    ? Math.min(3_600_000, Math.max(1000, delay))
-    : 60_000;
+  // A non-positive delay is no more trustworthy than a malformed one: the key
+  // was just rate-limited, so fall back to the default rather than a token 1s.
+  return delay > 0 ? Math.min(3_600_000, Math.max(1000, delay)) : 60_000;
 }
 
 export function classifyFailure(

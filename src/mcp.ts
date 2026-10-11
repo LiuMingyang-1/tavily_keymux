@@ -41,7 +41,7 @@ export async function handleMcp(
   const annotations = {
     readOnlyHint: true,
     destructiveHint: false,
-    idempotentHint: false,
+    idempotentHint: true,
     openWorldHint: true,
   };
   server.registerTool(
