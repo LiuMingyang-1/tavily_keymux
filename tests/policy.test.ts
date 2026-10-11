@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyFailure,
   classifyFailure,
   reconcile,
   retryDelay,
@@ -58,7 +59,58 @@ describe("key selection and failure policy", () => {
     expect(retryDelay("Sun, 11 Oct 2026 00:02:00 GMT", now)).toBe(120_000);
     expect(retryDelay("nonsense", now)).toBe(60_000);
     expect(retryDelay("99999999", now)).toBe(3_600_000);
-    expect(retryDelay("-1", now)).toBe(1000);
+  });
+
+  it("falls back to the default when Retry-After is a past date or garbage", () => {
+    const now = Date.parse("2026-10-11T00:00:00Z");
+    expect(retryDelay("Sun, 11 Oct 2026 00:00:00 GMT", now)).toBe(60_000);
+    expect(retryDelay("Sat, 10 Oct 2026 00:00:00 GMT", now)).toBe(60_000);
+    expect(retryDelay("-1", now)).toBe(60_000);
+    expect(retryDelay("not-a-date", now)).toBe(60_000);
+  });
+
+  it("drops failure results recorded against a generation superseded by reset", () => {
+    const state = reconcile(undefined, { primary: "a" });
+    const action = classifyFailure(429, "30", 1_000);
+    // A key persisted before generations existed counts as generation 0.
+    delete state.keys.primary!.generation;
+    applyFailure(state.keys.primary!, action, 0);
+    expect(state.keys.primary).toMatchObject({
+      failures: 1,
+      blockedUntil: 31_000,
+    });
+    // reset() bumps the generation; a result captured before it must not land.
+    state.keys.primary!.generation = 1;
+    applyFailure(state.keys.primary!, action, 0);
+    expect(state.keys.primary).toMatchObject({ failures: 1 });
+    applyFailure(state.keys.primary!, action, 1);
+    expect(state.keys.primary).toMatchObject({ failures: 2 });
+  });
+
+  it("still reaches a third key after two retryable failures", () => {
+    const now = 1_000;
+    const state = reconcile(undefined, {
+      first: "a",
+      second: "b",
+      third: "c",
+    });
+    const tried: string[] = [];
+    const fail = (id: string, status: number, retryAfter: string | null) => {
+      const action = classifyFailure(status, retryAfter, now);
+      const key = state.keys[id]!;
+      if (action.disabled) key.disabled = true;
+      if (action.blockedUntil) key.blockedUntil = action.blockedUntil;
+    };
+    // Mirror execute(): select a key, apply its failure, select again.
+    for (const [id, status, retryAfter] of [
+      ["first", 401, null],
+      ["second", 429, "30"],
+    ] as const) {
+      expect(selectKey(state, tried, now)).toBe(id);
+      tried.push(id);
+      fail(id, status, retryAfter);
+    }
+    expect(selectKey(state, tried, now)).toBe("third");
   });
 
   it("re-enables exhausted keys at the next UTC month, including year rollover", () => {

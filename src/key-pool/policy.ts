@@ -3,6 +3,8 @@ export interface KeyState {
   disabled: boolean;
   blockedUntil: number;
   reason?: string;
+  // Bumped by reset(); results dispatched against an older one are discarded.
+  generation?: number;
   successes: number;
   failures: number;
   reportedCredits: number;
@@ -26,6 +28,7 @@ export function emptyKey(fingerprint: string): KeyState {
     fingerprint,
     disabled: false,
     blockedUntil: 0,
+    generation: 0,
     successes: 0,
     failures: 0,
     reportedCredits: 0,
@@ -76,9 +79,9 @@ export function retryDelay(header: string | null, now: number): number {
   const delay = Number.isFinite(seconds)
     ? seconds * 1000
     : Date.parse(header) - now;
-  return Number.isFinite(delay)
-    ? Math.min(3_600_000, Math.max(1000, delay))
-    : 60_000;
+  // A non-positive delay is no more trustworthy than a malformed one: the key
+  // was just rate-limited, so fall back to the default rather than a token 1s.
+  return delay > 0 ? Math.min(3_600_000, Math.max(1000, delay)) : 60_000;
 }
 
 export function classifyFailure(
@@ -114,4 +117,21 @@ export function classifyFailure(
     };
   }
   return { retry: false, code: "UPSTREAM_REJECTED" };
+}
+
+/**
+ * Applies a classified failure. A result captured before reset() bumped the
+ * key's generation is stale and must not re-disable the refreshed key.
+ */
+export function applyFailure(
+  key: KeyState,
+  action: FailureAction,
+  generation: number,
+): void {
+  if ((key.generation ?? 0) !== generation) return;
+  key.failures++;
+  key.reason = action.code;
+  if (action.disabled) key.disabled = true;
+  if (action.blockedUntil)
+    key.blockedUntil = Math.max(key.blockedUntil, action.blockedUntil);
 }
