@@ -4,6 +4,7 @@ import { readKeys } from "../config.js";
 import { extractSchema, searchSchema } from "../schemas.js";
 import type { Env, JsonObject, TavilyOperation } from "../types.js";
 import {
+  applyFailure,
   classifyFailure,
   emptyKey,
   reconcile,
@@ -119,10 +120,12 @@ export class TavilyKeyPool extends DurableObject<Env> {
       attempt < Math.min(MAX_KEY_ATTEMPTS, Object.keys(keys).length);
       attempt++
     ) {
-      const id = await this.update(fingerprints, (state) =>
-        selectKey(state, tried, Date.now()),
-      );
-      if (!id) break;
+      const selection = await this.update(fingerprints, (state) => {
+        const id = selectKey(state, tried, Date.now());
+        return id ? { id, generation: state.keys[id]!.generation ?? 0 } : null;
+      });
+      if (!selection) break;
+      const { id, generation } = selection;
       tried.push(id);
       let response: Response;
       let action: FailureAction;
@@ -147,7 +150,7 @@ export class TavilyKeyPool extends DurableObject<Env> {
       } catch {
         clearTimeout(timeout);
         action = classifyFailure(0, null, Date.now());
-        await this.recordFailure(fingerprints, id, action);
+        await this.recordFailure(fingerprints, id, action, generation);
         lastFailure = action;
         continue;
       }
@@ -158,6 +161,12 @@ export class TavilyKeyPool extends DurableObject<Env> {
           data = await readResponse(response);
         } catch {
           // The provider may already have charged. Do not retry malformed/oversized successes.
+          await this.update(fingerprints, (state) => {
+            const key = state.keys[id]!;
+            if ((key.generation ?? 0) !== generation) return;
+            key.failures++;
+            key.reason = "INVALID_UPSTREAM_RESPONSE";
+          });
           return {
             ok: false,
             code: "INVALID_UPSTREAM_RESPONSE",
@@ -190,7 +199,7 @@ export class TavilyKeyPool extends DurableObject<Env> {
         Date.now(),
       );
       await response.body?.cancel().catch(() => undefined);
-      await this.recordFailure(fingerprints, id, action);
+      await this.recordFailure(fingerprints, id, action, generation);
       lastFailure = action;
       if (!action.retry) {
         return {
@@ -201,12 +210,21 @@ export class TavilyKeyPool extends DurableObject<Env> {
       }
     }
 
+    // Only advise waiting when nothing is usable right now; an available key
+    // means the client should retry immediately, not sit out a cooldown.
     const retryAfterSeconds = await this.update(fingerprints, (state) => {
+      const now = Date.now();
+      if (
+        Object.values(state.keys).some(
+          (key) => !key.disabled && key.blockedUntil <= now,
+        )
+      )
+        return undefined;
       const deadlines = Object.values(state.keys)
-        .filter((key) => !key.disabled && key.blockedUntil > Date.now())
+        .filter((key) => !key.disabled && key.blockedUntil > now)
         .map((key) => key.blockedUntil);
       return deadlines.length
-        ? Math.max(1, Math.ceil((Math.min(...deadlines) - Date.now()) / 1000))
+        ? Math.max(1, Math.ceil((Math.min(...deadlines) - now) / 1000))
         : undefined;
     });
     return {
@@ -222,14 +240,10 @@ export class TavilyKeyPool extends DurableObject<Env> {
     fingerprints: Record<string, string>,
     id: string,
     action: FailureAction,
+    generation: number,
   ) {
     await this.update(fingerprints, (state) => {
-      const key = state.keys[id]!;
-      key.failures++;
-      key.reason = action.code;
-      if (action.disabled) key.disabled = true;
-      if (action.blockedUntil)
-        key.blockedUntil = Math.max(key.blockedUntil, action.blockedUntil);
+      applyFailure(state.keys[id]!, action, generation);
     });
   }
 
@@ -266,6 +280,7 @@ export class TavilyKeyPool extends DurableObject<Env> {
       const fresh = emptyKey(key.fingerprint);
       state.keys[id] = {
         ...fresh,
+        generation: (key.generation ?? 0) + 1,
         successes: key.successes,
         failures: key.failures,
         reportedCredits: key.reportedCredits,

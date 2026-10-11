@@ -52,6 +52,22 @@ export async function handleApp(
           Allow: "POST",
         });
       const body = await readJsonBody(request);
+      // Reject JSON-RPC batches outright: each message in a batch consumes the
+      // pool's attempt budget and buffers its own result, so one HTTP request
+      // could fan out to hundreds of upstream calls. Non-object bodies are
+      // invalid too; fail with a clear 400 rather than an SDK 500.
+      if (typeof body !== "object" || body === null)
+        throw new ServiceError(
+          "INVALID_INPUT",
+          "The MCP request body must be a JSON-RPC message object.",
+          400,
+        );
+      if (Array.isArray(body))
+        throw new ServiceError(
+          "BATCH_NOT_SUPPORTED",
+          "JSON-RPC batches are not supported; send one JSON-RPC message per request.",
+          400,
+        );
       const response = await handleMcp(request, new TavilyProvider(pool), body);
       response.headers.set("Cache-Control", "no-store");
       return response;

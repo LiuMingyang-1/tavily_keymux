@@ -3,6 +3,8 @@ export interface KeyState {
   disabled: boolean;
   blockedUntil: number;
   reason?: string;
+  // Bumped by reset(); results dispatched against an older one are discarded.
+  generation?: number;
   successes: number;
   failures: number;
   reportedCredits: number;
@@ -26,6 +28,7 @@ export function emptyKey(fingerprint: string): KeyState {
     fingerprint,
     disabled: false,
     blockedUntil: 0,
+    generation: 0,
     successes: 0,
     failures: 0,
     reportedCredits: 0,
@@ -114,4 +117,21 @@ export function classifyFailure(
     };
   }
   return { retry: false, code: "UPSTREAM_REJECTED" };
+}
+
+/**
+ * Applies a classified failure. A result captured before reset() bumped the
+ * key's generation is stale and must not re-disable the refreshed key.
+ */
+export function applyFailure(
+  key: KeyState,
+  action: FailureAction,
+  generation: number,
+): void {
+  if ((key.generation ?? 0) !== generation) return;
+  key.failures++;
+  key.reason = action.code;
+  if (action.disabled) key.disabled = true;
+  if (action.blockedUntil)
+    key.blockedUntil = Math.max(key.blockedUntil, action.blockedUntil);
 }

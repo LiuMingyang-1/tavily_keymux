@@ -15,6 +15,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import worker from "../src/index.js";
 import { handleApp } from "../src/app.js";
+import { TavilyKeyPool, type ExecutionResult } from "../src/key-pool/object.js";
 import type { Env } from "../src/types.js";
 import type { PoolState } from "../src/key-pool/policy.js";
 
@@ -36,6 +37,7 @@ const replies: {
   body: string;
   headers?: Record<string, string>;
   expectedBody?: string;
+  ready?: () => Promise<unknown>;
   remaining: number;
 }[] = [];
 const unexpectedRequests: string[] = [];
@@ -121,6 +123,7 @@ beforeEach(() => {
         unexpectedRequests.push(`${request.method} ${request.url}`);
         throw new Error("Unmocked network access is forbidden in tests");
       }
+      await reply.ready?.();
       reply.remaining--;
       return new Response(reply.body, {
         status: reply.status,
@@ -302,6 +305,10 @@ describe("shared key pool and upstream behavior", () => {
         arguments: { query: "test" },
       });
       expect(result.result?.isError).not.toBe(true);
+      // One key is still available, so no retry hint is emitted.
+      expect(result.result?.content[0]?.text).not.toContain(
+        "retry_after_seconds",
+      );
       const status = (await (await request("/admin/status", admin)).json()) as {
         keys: { status: string; failures: number }[];
       };
@@ -352,6 +359,15 @@ describe("shared key pool and upstream behavior", () => {
     expect(malformed.result?.content[0]?.text).toContain(
       "INVALID_UPSTREAM_RESPONSE",
     );
+    // An unreadable success is counted, but the key stays usable.
+    const status = (await (await request("/admin/status", admin)).json()) as {
+      keys: { status: string; failures: number; last_failure: string | null }[];
+    };
+    expect(status.keys[1]).toMatchObject({
+      status: "available",
+      failures: 1,
+      last_failure: "INVALID_UPSTREAM_RESPONSE",
+    });
   });
 
   it("does not follow redirects with credentials or retry oversized successful responses", async () => {
@@ -432,5 +448,111 @@ describe("shared key pool and upstream behavior", () => {
       keys: { status: string; successes: number }[];
     };
     expect(status.keys[0]).toMatchObject({ status: "available", successes: 4 });
+  });
+});
+
+describe("attempt budget across larger pools", () => {
+  // TAVILY_API_KEYS is a fixed deployment binding, so key sets beyond the
+  // shared two-key fixture run inside the object with an overridden env; the
+  // shared msw guard still rejects unmocked keys.
+  const stub = () =>
+    testEnv.KEY_POOL.get(testEnv.KEY_POOL.idFromName("tavily-global-v1"));
+  function searchWith(keyIds: string[]) {
+    const keys = JSON.stringify(
+      Object.fromEntries(keyIds.map((id) => [id, `tvly-test-${id}`])),
+    );
+    return <T>(call: (pool: TavilyKeyPool) => T): Promise<T> =>
+      runInDurableObject(stub(), (instance, state) => {
+        const result = call(
+          new Proxy(instance as TavilyKeyPool, {
+            get: (target, prop) =>
+              prop === "env"
+                ? { ...testEnv, TAVILY_API_KEYS: keys }
+                : Reflect.get(target, prop),
+          }),
+        );
+        // Keep the isolate's event loop alive for in-flight pool work that
+        // outlives this scope (e.g. a held upstream fetch).
+        if (result instanceof Promise) state.waitUntil(result);
+        return result;
+      });
+  }
+
+  it("reaches a third key after two retryable failures", async () => {
+    upstream(429, {}, "k1");
+    upstream(429, {}, "k2");
+    upstream(200, searchResult, "k3");
+    const ok = await searchWith(["k1", "k2", "k3"])((pool) =>
+      pool.execute("search", { query: "test" }).then((r) => r.ok),
+    );
+    expect(ok).toBe(true);
+  });
+
+  it("never tries a fourth key once MAX_KEY_ATTEMPTS is reached", async () => {
+    upstream(429, {}, "k1");
+    upstream(429, {}, "k2");
+    upstream(429, {}, "k3");
+    const result = await searchWith(["k1", "k2", "k3", "k4"])((pool) =>
+      pool.execute("search", { query: "test" }),
+    );
+    // k4 is untouched and available, so no retry hint is emitted.
+    expect(result).toMatchObject({
+      ok: false,
+      retryAfterSeconds: undefined,
+    });
+  });
+
+  it("discards a failure dispatched before the key was reset", async () => {
+    let matched = () => {};
+    let release = () => {};
+    const dispatched = new Promise<void>((resolve) => {
+      matched = resolve;
+    });
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    replies.push({
+      path: "/search",
+      key: "k1",
+      status: 200,
+      body: "not json",
+      // Prove the request selected the key before reset() bumps its
+      // generation, then hold the response until the reset lands.
+      ready: async () => {
+        matched();
+        await hold;
+      },
+      remaining: 1,
+    });
+    const { result, status } = await runInDurableObject(
+      stub(),
+      async (instance, state) => {
+        const pool = new Proxy(instance as TavilyKeyPool, {
+          get: (target, prop) =>
+            prop === "env"
+              ? {
+                  ...testEnv,
+                  TAVILY_API_KEYS: JSON.stringify({ k1: "tvly-test-k1" }),
+                }
+              : Reflect.get(target, prop),
+        });
+        const pending = pool.execute("search", { query: "test" });
+        // The pool serializes storage, but execute is suspended awaiting
+        // the upstream fetch, so reset() runs first.
+        await dispatched;
+        await pool.reset("k1");
+        release();
+        const result = await pending;
+        const status = await pool.status();
+        return { result, status };
+      },
+    );
+    expect((result as { code: string }).code).toBe("INVALID_UPSTREAM_RESPONSE");
+    const keys = (status as { keys: Record<string, unknown>[] }).keys;
+    expect(keys[0]).toMatchObject({
+      status: "available",
+      failures: 0,
+      last_failure: null,
+    });
   });
 });

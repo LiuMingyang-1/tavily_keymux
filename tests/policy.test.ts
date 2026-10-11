@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyFailure,
   classifyFailure,
   reconcile,
   retryDelay,
@@ -66,6 +67,24 @@ describe("key selection and failure policy", () => {
     expect(retryDelay("Sat, 10 Oct 2026 00:00:00 GMT", now)).toBe(60_000);
     expect(retryDelay("-1", now)).toBe(60_000);
     expect(retryDelay("not-a-date", now)).toBe(60_000);
+  });
+
+  it("drops failure results recorded against a generation superseded by reset", () => {
+    const state = reconcile(undefined, { primary: "a" });
+    const action = classifyFailure(429, "30", 1_000);
+    // A key persisted before generations existed counts as generation 0.
+    delete state.keys.primary!.generation;
+    applyFailure(state.keys.primary!, action, 0);
+    expect(state.keys.primary).toMatchObject({
+      failures: 1,
+      blockedUntil: 31_000,
+    });
+    // reset() bumps the generation; a result captured before it must not land.
+    state.keys.primary!.generation = 1;
+    applyFailure(state.keys.primary!, action, 0);
+    expect(state.keys.primary).toMatchObject({ failures: 1 });
+    applyFailure(state.keys.primary!, action, 1);
+    expect(state.keys.primary).toMatchObject({ failures: 2 });
   });
 
   it("still reaches a third key after two retryable failures", () => {
