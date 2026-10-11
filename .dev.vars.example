@@ -1,0 +1,5 @@
+# Copy to .dev.vars; this example is never used automatically.
+# Generate each token independently: openssl rand -hex 32
+CLIENT_TOKENS='{"alma":"REPLACE_WITH_RANDOM_TOKEN_AT_LEAST_32_CHARS","hermes":"REPLACE_WITH_ANOTHER_RANDOM_TOKEN_AT_LEAST_32_CHARS"}'
+ADMIN_TOKEN='REPLACE_WITH_SEPARATE_RANDOM_TOKEN_AT_LEAST_32_CHARS'
+TAVILY_API_KEYS='{"primary":"tvly-REPLACE_FIRST_KEY","secondary":"tvly-REPLACE_SECOND_KEY"}'
